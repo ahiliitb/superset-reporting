@@ -2,7 +2,7 @@ import os
 import click
 import configparser
 from database import DatabaseConnectionPool as Database
-from log_parser import LogParser, BasicLogParser
+from log_parser import LogParser, BasicLogParser, LogParserWithLookup
 import applog
 
 script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -24,7 +24,17 @@ class AppContext:
 
     def load_parser(self, log_type: str):
         """Load the appropriate log parser based on log type."""
-        self.parser = BasicLogParser(self.db_manager, f"{log_type}_logs")
+
+        if log_type == "extended":
+            # self.parser = BasicLogParser(self.db_manager, f"{log_type}_logs")
+
+            self.parser = LogParserWithLookup(self.db_manager, f"{log_type}_logs", ["user_groups", "request_profiles", "response_profiles", "categories", "profiles", "download_content_types", "upload_content_types", "time_profiles", "application_signatures"])
+
+            # self.parser = LogParserLookup(self.db_manager, f"{log_type}_logs", ["method", "filter_name", "username", "status", "client_ip", "mime", "cachecode", "peercode"])
+
+        else:
+            self.parser = BasicLogParser(self.db_manager, f"{log_type}_logs")
+        
         self.parser.load_log_schema(log_type, log_structure_path)
 
 pass_context = click.make_pass_decorator(AppContext, ensure=True)
@@ -104,7 +114,15 @@ def insert(ctx: AppContext, log_type: str, path: str, workers: int):
         return
 
     ctx.load_parser(log_type)
+
+    initial_size = ctx.parser.database.get_database_size()
+    # print(f"Size of database before insertion: {initial_size}")
+
     ctx.parser.insert_log_files(log_files, workers)
+
+    final_size = ctx.parser.database.get_database_size()
+    # print(f"Size of database after insertion: {final_size}")
+    print(f"Size increased: {(final_size - initial_size)//1024} KB")
     print("Logs inserted successfully.")
 
 if __name__ == "__main__":

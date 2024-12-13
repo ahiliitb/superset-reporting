@@ -91,6 +91,35 @@ class DatabaseConnectionPool:
         """        
         row_counts: Dict[str, int] = {table_name: row_count for table_name, row_count in self.execute_command(query)}
         return row_counts
+    
+
+    def fetch_all_table_data(self, table_name: str) -> List[Dict[str, Union[str, int, float, None]]]:
+        """
+        Fetch all content of the specified table.
+
+        Parameters:
+            table_name (str): The name of the table to fetch data from.
+
+        Returns:
+            List[Dict[str, Union[str, int, float, None]]]: A list of dictionaries where each dictionary represents a row.
+        """
+        # Fetch column names of the table
+        query = f"""
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_name = '{table_name}'
+        ORDER BY ordinal_position;
+        """
+        column_names = [row[0] for row in self.execute_command(query)]
+
+
+        # Fetch all rows from the table
+        fetch_query = f"SELECT * FROM {table_name};"
+        rows = self.execute_command(fetch_query)
+
+        # Convert rows to a list of dictionaries
+        all_data = [dict(zip(column_names, row)) for row in rows]
+        return all_data
 
     def clear_database(self, db_name:str=None) -> None:
         if db_name:
@@ -110,6 +139,47 @@ class DatabaseConnectionPool:
         """
         table_names = [row[0] for row in self.execute_command(query)]
         return table_names
+    
+    def fetch_lookup_table_as_dict(self, table_name: str, schema: List[TableColumn]) -> Dict[str, int]:
+        """
+        Fetches data from a lookup table and returns a dictionary with a string column as key
+        and an integer column as value.
+
+        Parameters:
+            database (DatabaseConnectionPool): The database connection pool.
+            table_name (str): The name of the lookup table.
+            schema (List[TableColumn]): The schema of the lookup table.
+
+        Returns:
+            Dict[str, int]: A dictionary with string keys and integer values.
+        """
+        # Find the string and integer columns in the schema
+        string_column = None
+        int_column = None
+        for column in schema:
+            if column.datatype.lower() in {"varchar", "text", "char"}:
+                string_column = column.name
+            elif column.datatype.lower() in {"int", "integer", "bigint", "smallint"}:
+                int_column = column.name
+
+            # Break the loop if both columns are identified
+            if string_column and int_column:
+                break
+
+        if not string_column or not int_column:
+            raise ValueError("Schema must contain one string column and one integer column.")
+
+        # SQL query to fetch data from the table
+        query = f"SELECT {string_column}, {int_column} FROM {table_name};"
+
+        # Execute the query and fetch results
+        results = self.execute_command(query)
+
+        # Convert the results into a dictionary
+        lookup_dict = {row[0]: row[1] for row in results}
+
+        return lookup_dict
+
 
     def create_table(self, table_name:str, schema: List[TableColumn]):
         """Creates a table with the given name and schema."""
@@ -141,6 +211,33 @@ class DatabaseConnectionPool:
         placeholders_str = ', '.join(placeholders)
         query = f'INSERT INTO {table_name} ({columns_str}) VALUES ({placeholders_str}) ON CONFLICT DO NOTHING'
         self.execute_command(query, formatted_values)
+
+    def print_table_content(self, table_name: str):
+        table_data = self.fetch_all_table_data(table_name)
+        for row in table_data:
+            print(row)
+        return
+    
+    def get_database_size(self) -> int:
+        """
+        Fetches the size of the connected database with optimized querying.
+        
+        Returns:
+            int: The size of the database in bytes.
+        """
+        try:
+            with self.pool.getconn() as conn:  # Get a connection from the pool
+                with conn.cursor() as cur:
+                    # Execute the database size query
+                    cur.execute("SELECT pg_database_size(current_database());")
+                    result = cur.fetchone()
+                    return result[0] if result else 0
+        except Exception as e:
+            print(f"Error fetching database size: {e}")
+            return 0
+        finally:
+            self.pool.putconn(conn)  # Always return the connection to the pool
+
     
     def __repr__(self) -> str:
         schema = self.fetch_table_schema()

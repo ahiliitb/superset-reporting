@@ -1,5 +1,5 @@
 import logging
-from typing import List, Tuple
+from typing import List, Tuple, Union, Dict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 import csv
@@ -77,6 +77,18 @@ class LogParser:
         # Skip the header line
         lines = lines[1:]
         
+        # # ## for testing 
+        # k = 0
+        # newlines = lines.copy()
+        # while(len(newlines) < 30000):
+        #     # print(len(newlines))
+        #     for line in lines:
+        #         newlines.append(f"{k}" + line)
+        #         k += 1
+        
+        # lines = newlines
+        # #### TEsting end here
+
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             with tqdm(total=len(lines), desc="Inserting log lines") as pbar:
                 futures = {executor.submit(self.insert_log, line.strip()): line.strip() for line in lines if line.strip()}
@@ -93,6 +105,7 @@ class LogParser:
         for log_file in log_files:
             self.insert_log_file(log_file, workers)
             applog.logger.debug(f"Log file {log_file} inserted successfully.")
+        
 
     def parse_log_line(self, log_line: str) -> Tuple:
         try:
@@ -134,6 +147,7 @@ class BasicLogParser(LogParser):
 
     def load_log_schema(self, log_type: str, xml_file: str) -> None:
         super().load_log_schema(log_type, xml_file)
+
         self.set_table_schema()
         for col in self.table_schema:
             applog.logger.debug(col)
@@ -164,3 +178,172 @@ class BasicLogParser(LogParser):
         for column in self.table_schema:
             str_basiclogparser += f"{column}\n"
         return str_basiclogparser
+    
+
+# Look up feature class
+class LogParserWithLookup(LogParser):
+
+    def __init__(self, database: DatabaseConnectionPool, main_table:str, lookup_columns_name: List[str], *args, **kwargs):
+        super().__init__(database, *args, **kwargs)
+        self.main_table = main_table # main table name
+        self.lookup_columns: List[LogColumn] = [] # contains all lookup column obj
+        self.lookuptables: Dict[str, dict] = {} # all lookup table stored as dict of dict
+        self.main_table_schema: List[TableColumn] = [] # main table schema
+        self.lookuptable_schema: List[TableColumn] = [] # lookup table schema
+        self.columnindex: Dict[str, int] = {} # lookup log column index as dict
+        self.initialise_columnindex_with_null(lookup_columns_name)
+
+    def initialise_columnindex_with_null(self, lookup_columns_name: List[str]):
+        for colname in lookup_columns_name:
+            self.columnindex[colname] = None
+
+    def initialise_lookup(self):
+        self.set_lookuptable_schema()
+        self.initialise_logcolumn_index_and_logcolumn()
+        self.initialise_lookuptables()
+
+    def set_lookuptable_schema(self):
+        self.lookuptable_schema = [TableColumn( name = "key", datatype = "INTEGER", isArray = False, isPrimary = True), TableColumn(name = "value", datatype = "TEXT", isArray = False, isPrimary = False)]
+
+    # initialise single lookup table for a column
+    def initialise_single_lookuptable(self, single_log_column: LogColumn):
+        tables_name = self.database.fetch_table_names()
+
+        # if single_log_column.name not in tables_name:
+        if "lookuptable" not in tables_name:
+            # creating new lookup table
+            # self.database.create_table(single_log_column.name, self.lookuptable_schema)
+            self.database.create_table("lookuptable", self.lookuptable_schema)
+            lookupdict = {}
+        else:
+            # lookupdict: dict = self.database.fetch_lookup_table_as_dict(single_log_column.name, self.lookuptable_schema)
+            lookupdict: dict = self.database.fetch_lookup_table_as_dict("lookuptable", self.lookuptable_schema)
+
+        return lookupdict
+    
+    # initialise all lookup table and store it as dict of dict
+    def initialise_lookuptables(self):
+        for lookup_log_col in self.lookup_columns:
+            # self.lookuptables[lookup_log_col.name] = self.initialise_single_lookuptable(lookup_log_col)
+            self.lookuptables["lookuptable"] = self.initialise_single_lookuptable(lookup_log_col)
+        return
+
+    # get log column index and col
+    def get_logcolumn_index_and_col(self, column_name: str):
+        for i, col in enumerate(self.log_schema):
+            if(col.name == column_name): return i, col
+        
+        return -1, None
+
+    # initialise lookup columns index
+    def initialise_logcolumn_index_and_logcolumn(self):
+
+        for lookup_log_col_name in self.columnindex.keys():
+            index, col = self.get_logcolumn_index_and_col(lookup_log_col_name)
+            if index == -1: 
+                raise ValueError("Column not found in the logcolumn")
+            else:
+                self.columnindex[lookup_log_col_name] = index
+                self.lookup_columns.append(col)
+        return
+    
+    def load_log_schema(self, log_type: str, xml_file: str) -> None:
+        super().load_log_schema(log_type, xml_file)
+        self.initialise_lookup()
+        self.set_main_table_schema()
+        for col in self.main_table_schema:
+            applog.logger.debug(col)
+    
+    def set_main_table_schema(self) -> None:
+        self.main_table_schema = [TableColumn(column.name, column.datatype, column.isArray, column.isPrimary, column.data_format) if column.name not in self.columnindex.keys() else TableColumn(column.name, "INTEGER" if not column.isArray else "TEXT", not column.isArray, column.isPrimary, column.data_format) for column in self.log_schema]
+
+    # handles single column and convert it to required type
+    def update_single_column(self, value: Union[str, list], log_col: LogColumn):
+
+        # col_dict: dict = self.lookuptables[log_col.name]
+        col_dict: dict = self.lookuptables["lookuptable"]
+        if type(value) == str and not log_col.isArray:
+            if value in col_dict.keys():
+                return col_dict[value]
+            else:
+                # self.lookuptables[log_col.name][value] = len(col_dict)
+                self.lookuptables["lookuptable"][value] = len(col_dict)
+                return len(col_dict)
+        elif log_col.isArray:
+            if type(value) == str:
+                if value in col_dict.keys():
+                    return str(col_dict[value])
+                else:
+                    # self.lookuptables[log_col.name][value] = len(col_dict)
+                    self.lookuptables["lookuptable"][value] = len(col_dict)
+                    return str(len(col_dict))
+                    
+            else:
+                list_as_str_with_comma: str = ""
+                for val in value:
+                    # col_dict: dict = self.lookuptables[log_col.name]
+                    col_dict: dict = self.lookuptables["lookuptable"]
+                    if val in col_dict.keys():
+                        list_as_str_with_comma += (str(col_dict[val]) + ",")
+                    else:
+                        # self.lookuptables[log_col.name][val] = len(col_dict)
+                        self.lookuptables["lookuptable"][val] = len(col_dict)
+                        list_as_str_with_comma += (str(len(col_dict)) + ",")
+                
+                return list_as_str_with_comma[:-1] # leave last comma
+        else:
+            raise ValueError("Wrong format for the log column in the value")
+            
+            
+    # change all column to required datatype to storage for a single line
+    def update_log_line(self, log_line: tuple):
+
+        log_line_list = list(log_line)
+        for idx, (_, col_index) in enumerate(self.columnindex.items()):
+            log_line_list[col_index] = self.update_single_column(log_line_list[col_index], self.lookup_columns[idx])
+
+        return tuple(log_line_list)
+    
+    
+    def insert_log(self, log_line: str) -> None:
+        
+        # Parse the TSV string
+        try:
+            log_data = self.parse_log_line(log_line)
+
+            # Change input columns to INTEGER 
+            log_data = self.update_log_line(log_data)
+            
+        except Exception as e:
+            applog.logger.warning(f"Error parsing TSV: {e}")
+            return None
+        try:
+            # Insert log entry
+            self.database.insert_data(self.main_table, self.main_table_schema, log_data)
+        except Exception as e:
+            applog.logger.warning(f"Error inserting log: {e}")
+
+    def create_tables(self) -> None:
+        self.database.create_table(self.main_table, self.main_table_schema)
+    
+    def insert_log_files(self, log_files: List[str], workers:int = 10) -> None:
+
+        super().insert_log_files(log_files, workers)
+        for col_name, col_dict in self.lookuptables.items():
+            for key, value in col_dict.items():
+                self.database.insert_data(col_name, self.lookuptable_schema, (value, key))
+
+        # print(self.database.print_table_content("extended_logs"))
+        return
+    
+    def __repr__(self) -> str:
+        str_LogParserWithLookup = super().__repr__()
+        str_LogParserWithLookup += f"\nMain Table: {self.main_table}"
+        str_LogParserWithLookup += "\nTable Schema:\n"
+        for column in self.table_schema:
+            str_LogParserWithLookup += f"{column}\n"
+        return str_LogParserWithLookup
+
+    
+
+    
